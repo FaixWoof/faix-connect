@@ -24,5 +24,22 @@ curl -fsSL https://raw.githubusercontent.com/FaixWoof/faix-connect/main/connect-
 Flags: `--kind hermes|claude|codex` (si el host tiene varios agentes),
 `--portal URL`, `--serve-port 9119`, `--no-serve`.
 
-Si el server no alcanza el portal, el script imprime el puente SSH exacto
-(patrón validado con GIR y ZIM).
+## Servidor REMOTO (VPS / nube) — sin túneles
+
+Si el server está fuera de la red del portal, agrega `--remote` (Hermes):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/FaixWoof/faix-connect/main/connect-agent.sh | sudo -H bash -s -- \
+  --id mi-agente --name MiAgente --location mihost --remote
+```
+
+Publica `hermes serve --host 0.0.0.0` con el proveedor de auth **oficial**
+de Hermes (usuario+contraseña "basic"; un bind público siempre exige auth),
+abre el firewall local e imprime las credenciales para pegarlas en el portal
+(Conectar agente → "¿Tu servidor está en OTRA red?"). Recuerda abrir el
+puerto también en el firewall de tu nube (Oracle: VCN → Security List →
+Ingress TCP 9119). El estado lo deriva el portal sondeando `GET /api/status`.
+
+**Multi-instancia:** cada usuario del sistema = un agente distinto. El script
+siempre imprime qué instancia va a conectar; para instancias de root usa
+`sudo -H` (patrón validado con ZIM, con Snoopy conviviendo en el mismo server).
