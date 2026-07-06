@@ -2,7 +2,7 @@
 # ==========================================================================
 # F-AIX Portal — conector UNIVERSAL de agentes (plug & play)
 #
-# Un solo comando en el servidor del agente, con el usuario dueño del agente:
+# Un solo comando en el servidor del agente, CON EL USUARIO DUEÑO del agente:
 #
 #   curl -fsSL http://IP_PORTAL:3000/connect-agent.sh | bash -s -- \
 #       --id mi-agente --name MiAgente --location mihost
@@ -12,12 +12,23 @@
 #   · Hermes  → hermes serve (chat en vivo) + reporter de estado real
 #   · Claude  → hooks oficiales (report_status.py) → estado real por evento
 #   · Codex   → wrapper faix-codex (envuelve `codex exec` reportando estado)
-# Si el server no alcanza el portal, te dice exactamente qué puente SSH crear
-# (el mismo patrón validado con GIR y ZIM).
+#
+# MODO REMOTO (--remote): para servers FUERA de la red del portal (VPS, nube).
+# Sin túneles SSH: el serve de Hermes se publica con autenticación oficial
+# (usuario+contraseña, proveedor "basic") y el PORTAL se conecta directo:
+#   agente:  hermes serve --host 0.0.0.0 + credenciales  (este script lo hace)
+#   portal:  Conectar agente → Remoto → pegar URL + credenciales
+# El estado lo deriva el portal sondeando GET /api/status (público) — aquí
+# no se instala reporter porque el server no puede alcanzar al portal.
+#
+# IDENTIDAD / MULTI-INSTANCIA: cada usuario del sistema = UN agente distinto
+# (p.ej. /root/.hermes = un agente; /home/otro/.hermes = OTRO agente). El
+# script siempre te dice qué instancia va a conectar antes de tocar nada.
 # ==========================================================================
 set -euo pipefail
 
-ID="" NAME="" LOCATION="" KIND="" PORTAL="http://127.0.0.1:3000" SERVE_PORT="9119" NO_SERVE="0"
+ID="" NAME="" LOCATION="" KIND="" PORTAL="http://127.0.0.1:3000" SERVE_PORT="9119"
+NO_SERVE="0" REMOTE="0" AUTH_USER="faix" AUTH_PASS=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -28,12 +39,17 @@ while [ $# -gt 0 ]; do
     --portal) PORTAL="$2"; shift 2;;
     --serve-port) SERVE_PORT="$2"; shift 2;;
     --no-serve) NO_SERVE="1"; shift;;
+    --remote) REMOTE="1"; shift;;
+    --auth-user) AUTH_USER="$2"; shift 2;;
+    --auth-pass) AUTH_PASS="$2"; shift 2;;
     *) echo "flag desconocida: $1"; exit 1;;
   esac
 done
 
 [ -n "$ID" ] && [ -n "$NAME" ] && [ -n "$LOCATION" ] || {
-  echo "uso: connect-agent.sh --id <agent-id> --name <Nombre> --location <host> [--kind hermes|claude|codex] [--portal URL]"
+  echo "uso: connect-agent.sh --id <agent-id> --name <Nombre> --location <host>"
+  echo "     [--kind hermes|claude|codex] [--portal URL] [--remote]"
+  echo "     [--serve-port 9119] [--auth-user faix] [--auth-pass ...]"
   exit 1
 }
 
@@ -44,6 +60,20 @@ command -v systemctl >/dev/null 2>&1 && HAS_SYSTEMD="1"
 echo "→ sistema: $OS $( [ "$HAS_SYSTEMD" = "1" ] && echo '(systemd ✓)' || echo '(sin systemd)')"
 if [ "$OS" = "Darwin" ]; then
   echo "  macOS detectado: instalo los scripts; los servicios te los doy como comandos manuales (launchd opcional)."
+fi
+
+# --------------------- 0b. identidad y multi-instancia ---------------------
+echo "→ identidad: usuario $(whoami)  (HOME=$HOME)"
+OTHER_INSTANCES=""
+for d in /root /home/*; do
+  [ "$d" = "$HOME" ] && continue
+  [ -d "$d/.hermes" ] 2>/dev/null && OTHER_INSTANCES="$OTHER_INSTANCES $d"
+done
+if [ -n "$OTHER_INSTANCES" ]; then
+  echo "⚠ OJO — hay OTRAS instancias Hermes en esta máquina:$OTHER_INSTANCES"
+  echo "  Cada usuario del sistema = un agente DISTINTO con su propia identidad."
+  echo "  Este comando conecta SOLO la instancia de $(whoami): $HOME/.hermes"
+  echo "  Si querías conectar otra, cancela (Ctrl-C) y corre el script como ese usuario."
 fi
 
 # --------------------------- 1. detectar agente ----------------------------
@@ -62,18 +92,32 @@ if [ -z "$KIND" ]; then
 fi
 
 # ----------------------------- 2. ver portal -------------------------------
-echo "→ probando portal $PORTAL …"
-if ! curl -fsS --max-time 6 "$PORTAL/api/agents" >/dev/null; then
-  echo "✗ Este server no alcanza el portal. Crea el PUENTE (desde la máquina del portal):"
-  echo "    ssh -N -R 3000:127.0.0.1:3000 <ssh-alias-de-este-server>"
-  echo "  (déjalo como servicio systemd tipo faix-*-tunnel, patrón GIR/ZIM) y reintenta."
-  exit 1
+if [ "$REMOTE" = "1" ]; then
+  echo "→ modo REMOTO: este server está fuera de la red del portal (no se prueba el portal)."
+  if [ "$KIND" != "hermes" ]; then
+    echo "✗ El modo remoto hoy aplica a Hermes (claude/codex reportan POR PUSH y necesitan alcanzar el portal)."
+    echo "  Para claude/codex remotos: expón el portal o usa una VPN, y corre sin --remote."
+    exit 1
+  fi
+else
+  echo "→ probando portal $PORTAL …"
+  if ! curl -fsS --max-time 6 "$PORTAL/api/agents" >/dev/null; then
+    echo "✗ Este server no alcanza el portal ($PORTAL)."
+    echo "  ¿Este server está en OTRA red (VPS / nube)? → vuelve a correr con --remote:"
+    echo "    el serve de Hermes se publica con usuario+contraseña y el portal se"
+    echo "    conecta directo; no se necesita túnel."
+    echo "  Alternativa avanzada (misma red con firewall): puente SSH inverso desde el portal:"
+    echo "    ssh -N -R 3000:127.0.0.1:3000 <ssh-alias-de-este-server>"
+    exit 1
+  fi
+  echo "✓ portal alcanzable"
 fi
-echo "✓ portal alcanzable"
 
 BIN_DIR="$HOME/.local/bin/faix"; mkdir -p "$BIN_DIR"
 if [ "$(id -u)" = "0" ]; then UNIT_DIR="/etc/systemd/system"; SCTL="systemctl"; WANTED="multi-user.target"; else
   UNIT_DIR="$HOME/.config/systemd/user"; SCTL="systemctl --user"; WANTED="default.target"; mkdir -p "$UNIT_DIR"; fi
+
+UNIT_EXTRA=""   # líneas extra de [Service] (p.ej. Environment=) — la usa el modo remoto
 
 install_unit() { # $1 nombre, $2 ExecStart
   [ "$HAS_SYSTEMD" = "1" ] || { echo "  (sin systemd) corre a mano: $2"; return 0; }
@@ -86,6 +130,7 @@ ExecStart=$2
 Restart=always
 RestartSec=5
 WorkingDirectory=${HOME}
+${UNIT_EXTRA}
 [Install]
 WantedBy=${WANTED}
 EOF
@@ -107,6 +152,58 @@ if [ "$KIND" = "hermes" ]; then
   "$VENV_PY" -m hermes_cli.main --version | head -1 || {
     echo "⚠ Hermes no responde. Si es primera vez: corre 'hermes' una vez para loguearte (Nous Portal) y reintenta."; exit 1; }
 
+  # ---------- REMOTO: serve público con auth basic, sin túnel ni reporter ----
+  if [ "$REMOTE" = "1" ]; then
+    [ -n "$AUTH_PASS" ] || AUTH_PASS="$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+    AUTH_SECRET="$(head -c 96 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"
+
+    UNIT_EXTRA="Environment=HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${AUTH_USER}
+Environment=HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${AUTH_PASS}
+Environment=HERMES_DASHBOARD_BASIC_AUTH_SECRET=${AUTH_SECRET}"
+    install_unit "faix-serve-${ID}" "${VENV_PY} -m hermes_cli.main serve --host 0.0.0.0 --port ${SERVE_PORT}"
+    UNIT_EXTRA=""
+
+    # Firewall local: abrir el puerto (best-effort, según lo que haya).
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+      ufw allow "${SERVE_PORT}/tcp" >/dev/null 2>&1 && echo "  firewall: ufw allow ${SERVE_PORT}/tcp ✓"
+    elif command -v iptables >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
+      if ! iptables -C INPUT -p tcp --dport "${SERVE_PORT}" -j ACCEPT 2>/dev/null; then
+        iptables -I INPUT -p tcp --dport "${SERVE_PORT}" -j ACCEPT && echo "  firewall: iptables ACCEPT ${SERVE_PORT}/tcp ✓"
+        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+      else
+        echo "  firewall: puerto ${SERVE_PORT} ya permitido en iptables ✓"
+      fi
+    fi
+
+    # Autocomprobación local: el gate debe estar ACTIVO y con el proveedor basic.
+    sleep 4
+    STATUS_JSON="$(curl -fsS --max-time 8 "http://127.0.0.1:${SERVE_PORT}/api/status" 2>/dev/null || true)"
+    if echo "$STATUS_JSON" | grep -q '"auth_required"[: ]*true' && echo "$STATUS_JSON" | grep -q '"basic"'; then
+      echo "✓ serve público con auth activa (proveedor basic)"
+    else
+      echo "⚠ El serve aún no reporta auth activa; revisa: journalctl -u faix-serve-${ID} -n 30"
+    fi
+
+    PUBLIC_IP="$(curl -fsS --max-time 6 ifconfig.me 2>/dev/null || curl -fsS --max-time 6 api.ipify.org 2>/dev/null || echo '<IP-PUBLICA>')"
+    echo
+    echo "════════════════════════════════════════════════════════════════"
+    echo "✓ ${NAME} (Hermes REMOTO) listo. Ahora, en el PORTAL:"
+    echo "  Mission Control → Conectar agente → \"Servidor remoto\" y pega:"
+    echo "    URL del gateway : http://${PUBLIC_IP}:${SERVE_PORT}"
+    echo "    Usuario         : ${AUTH_USER}"
+    echo "    Contraseña      : ${AUTH_PASS}"
+    echo "    ID / Nombre / Ubicación : ${ID} / ${NAME} / ${LOCATION}"
+    echo
+    echo "  Si el portal no llega a esa URL, abre el puerto ${SERVE_PORT} en el"
+    echo "  firewall de tu NUBE (p.ej. Oracle: VCN → Security List → Ingress"
+    echo "  TCP ${SERVE_PORT}). El firewall local ya quedó abierto."
+    echo "════════════════════════════════════════════════════════════════"
+    echo
+    echo "Listo 🐾 — sin túneles: el portal habla directo y con credenciales."
+    exit 0
+  fi
+
+  # ---------- LOCAL (misma red): serve loopback + túnel + reporter ----------
   cat > "$BIN_DIR/faix_reporter_${ID}.py" <<PYEOF
 #!/usr/bin/env python3
 import json, socket, time, urllib.request
