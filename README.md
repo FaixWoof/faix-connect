@@ -11,7 +11,7 @@ curl -fsSL http://IP_DEL_PORTAL:3000/connect-agent.sh | bash -s -- \
   --id mi-agente --name MiAgente --location mihost
 
 # o desde este repo:
-curl -fsSL https://raw.githubusercontent.com/TU_USUARIO/faix-connect/main/connect-agent.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/FaixWoof/faix-connect/main/connect-agent.sh | bash -s -- \
   --id mi-agente --name MiAgente --location mihost --portal http://IP_DEL_PORTAL:3000
 ```
 
