@@ -83,14 +83,16 @@ fi
 
 # --------------------------- 1. detectar agente ----------------------------
 FOUND=""
-[ -x "$HOME/.hermes/hermes-agent/venv/bin/python" ] && FOUND="$FOUND hermes"
+# Hermes se instala de DOS formas: venv del repo (~/.hermes/hermes-agent/venv)
+# o CLI en el PATH (pipx/pip → binario `hermes`). Aceptamos ambas.
+{ [ -x "$HOME/.hermes/hermes-agent/venv/bin/python" ] || command -v hermes >/dev/null 2>&1; } && FOUND="$FOUND hermes"
 command -v claude >/dev/null 2>&1 && FOUND="$FOUND claude"
 command -v codex >/dev/null 2>&1 && FOUND="$FOUND codex"
 FOUND="$(echo "$FOUND" | xargs || true)"
 
 if [ -z "$KIND" ]; then
   case "$(echo "$FOUND" | wc -w | xargs)" in
-    0) echo "✗ No encontré Hermes (~/.hermes/hermes-agent), ni claude, ni codex para el usuario $(whoami)."; exit 1;;
+    0) echo "✗ No encontré Hermes (~/.hermes/hermes-agent ni 'hermes' en el PATH), ni claude, ni codex para el usuario $(whoami)."; exit 1;;
     1) KIND="$FOUND"; echo "✓ detectado: $KIND";;
     *) echo "⚠ Hay varias tecnologías aquí: $FOUND"; echo "  Vuelve a correr con --kind <una de ellas>."; exit 1;;
   esac
@@ -166,9 +168,31 @@ post_status() { # $1 status, $2 nota
 
 # ============================== HERMES =====================================
 if [ "$KIND" = "hermes" ]; then
-  VENV_PY="$HOME/.hermes/hermes-agent/venv/bin/python"
-  "$VENV_PY" -m hermes_cli.main --version | head -1 || {
+  # Resuelve el ejecutable Hermes según cómo esté instalado. HERMES_CMD acepta
+  # subcomandos directamente:  "$HERMES_CMD serve …"  /  "$HERMES_CMD --version".
+  if [ -x "$HOME/.hermes/hermes-agent/venv/bin/python" ]; then
+    HERMES_CMD="$HOME/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main"
+  else
+    HERMES_CMD="$(command -v hermes)"
+  fi
+  HVER="$($HERMES_CMD --version 2>/dev/null | head -1)"
+  [ -n "$HVER" ] || {
     echo "⚠ Hermes no responde. Si es primera vez: corre 'hermes' una vez para loguearte (Nous Portal) y reintenta."; exit 1; }
+  echo "  Hermes: ${HVER}"
+
+  # VALIDACIÓN CLAVE: el chat en vivo del portal usa el backend 'serve'
+  # (JSON-RPC/WebSocket). Versiones viejas de Hermes NO lo traen (tienen
+  # 'dashboard'/'gateway', que NO sirven para esto). Si falta, guiamos a
+  # actualizar + Nous Portal en vez de instalar un servicio que no arrancaría.
+  if ! $HERMES_CMD serve --help 2>&1 | grep -qiE 'backend server|--port|json-rpc|websocket'; then
+    echo "✗ Tu Hermes (${HVER}) no expone el backend 'serve' que el portal necesita para el chat en vivo."
+    echo "  (El 'gateway' de mensajería —Telegram/Discord— NO sirve para esto; hace falta 'hermes serve'.)"
+    echo "  Arréglalo y reintenta:"
+    echo "   1) Actualiza Hermes:   hermes update        (o reinstala la última versión)"
+    echo "   2) Regístrate/loguéate en Nous Portal:   hermes login   (o: hermes portal)"
+    exit 1
+  fi
+  echo "✓ backend 'serve' disponible"
 
   # ---------- REMOTO: serve público con auth basic, sin túnel ni reporter ----
   if [ "$REMOTE" = "1" ]; then
@@ -178,7 +202,7 @@ if [ "$KIND" = "hermes" ]; then
     UNIT_EXTRA="Environment=HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${AUTH_USER}
 Environment=HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${AUTH_PASS}
 Environment=HERMES_DASHBOARD_BASIC_AUTH_SECRET=${AUTH_SECRET}"
-    install_unit "faix-serve-${ID}" "${VENV_PY} -m hermes_cli.main serve --host 0.0.0.0 --port ${SERVE_PORT}"
+    install_unit "faix-serve-${ID}" "${HERMES_CMD} serve --host 0.0.0.0 --port ${SERVE_PORT}"
     UNIT_EXTRA=""
 
     # Firewall local: abrir el puerto (best-effort, según lo que haya).
@@ -221,7 +245,16 @@ Environment=HERMES_DASHBOARD_BASIC_AUTH_SECRET=${AUTH_SECRET}"
     exit 0
   fi
 
-  # ---------- LOCAL (misma red): serve loopback + túnel + reporter ----------
+  # ---------- LOCAL (misma red): serve con AUTH + túnel + reporter ----------
+  # Usamos el MISMO protocolo autenticado que el remoto: es robusto porque NO
+  # depende de que el serve monte la UI web (de donde saldría el token del modo
+  # loopback) — eso varía entre builds/instalaciones de Hermes (pipx vs venv) y
+  # puede dejar el chat sin token. El serve escucha en 0.0.0.0 con usuario+
+  # contraseña; el portal lo alcanza por un túnel SSH a loopback (sin abrir el
+  # firewall a la LAN) y habla el protocolo gated (login → ws-ticket).
+  [ -n "$AUTH_PASS" ] || AUTH_PASS="$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+  AUTH_SECRET="$(head -c 96 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"
+
   cat > "$BIN_DIR/faix_reporter_${ID}.py" <<PYEOF
 #!/usr/bin/env python3
 import json, socket, time, urllib.request
@@ -244,12 +277,30 @@ while True:
     time.sleep(4)
 PYEOF
   chmod +x "$BIN_DIR/faix_reporter_${ID}.py"
-  [ "$NO_SERVE" = "0" ] && install_unit "faix-serve-${ID}" "${VENV_PY} -m hermes_cli.main serve"
+  if [ "$NO_SERVE" = "0" ]; then
+    UNIT_EXTRA="Environment=HERMES_DASHBOARD_BASIC_AUTH_USERNAME=${AUTH_USER}
+Environment=HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${AUTH_PASS}
+Environment=HERMES_DASHBOARD_BASIC_AUTH_SECRET=${AUTH_SECRET}"
+    install_unit "faix-serve-${ID}" "${HERMES_CMD} serve --host 0.0.0.0 --port ${SERVE_PORT}"
+    UNIT_EXTRA=""
+  fi
   install_unit "faix-reporter-${ID}" "/usr/bin/python3 ${BIN_DIR}/faix_reporter_${ID}.py"
+
+  # Autocomprobación: el gate debe quedar ACTIVO con el proveedor basic.
+  sleep 4
+  STATUS_JSON="$(curl -fsS --max-time 8 "http://127.0.0.1:${SERVE_PORT}/api/status" 2>/dev/null || true)"
+  if echo "$STATUS_JSON" | grep -q '"auth_required"[: ]*true' && echo "$STATUS_JSON" | grep -q '"basic"'; then
+    echo "✓ serve local con auth activa (proveedor basic)"
+  else
+    echo "⚠ El serve aún no reporta auth; revisa: journalctl -u faix-serve-${ID} -n 30"
+  fi
+
   echo
-  echo "✓ ${NAME} (Hermes) conectado. Para CHAT EN VIVO falta 1 paso en el PORTAL:"
+  echo "✓ ${NAME} (Hermes) conectado. Para CHAT EN VIVO falta 1 paso EN EL PORTAL:"
   echo "  1) túnel:  ssh -N -L <puertoLibre>:127.0.0.1:${SERVE_PORT} <ssh-alias-de-este-server>  (servicio faix-*-tunnel)"
-  echo "  2) en .gateways.json del portal:  {\"${LOCATION}\": \"http://127.0.0.1:<puertoLibre>\"}"
+  echo "  2) en .gateways.json del portal, entrada AUTENTICADA (usuario+contraseña):"
+  echo "     \"${LOCATION}\": { \"url\": \"http://127.0.0.1:<puertoLibre>\", \"username\": \"${AUTH_USER}\", \"password\": \"${AUTH_PASS}\" }"
+  echo "  (guarda esta contraseña; el portal la necesita para el chat)"
 fi
 
 # ============================== CLAUDE CODE ================================
