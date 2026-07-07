@@ -2,10 +2,10 @@
 # ==========================================================================
 # F-AIX Portal — conector UNIVERSAL de agentes (plug & play)
 #
-# Un solo comando en el servidor del agente, CON EL USUARIO DUEÑO del agente:
+# Un solo comando en el servidor del agente, CON EL USUARIO DUEÑO del agente
+# (--name es lo único obligatorio; --id/--location se auto-completan):
 #
-#   curl -fsSL http://IP_PORTAL:3000/connect-agent.sh | bash -s -- \
-#       --id mi-agente --name MiAgente --location mihost
+#   curl -fsSL http://IP_PORTAL:3000/connect-agent.sh | bash -s -- --name MiAgente
 #
 # Detecta qué tecnología hay instalada (Hermes / Claude Code / Codex) y el
 # sistema operativo, instala SOLO lo necesario y te guía paso a paso:
@@ -46,12 +46,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$ID" ] && [ -n "$NAME" ] && [ -n "$LOCATION" ] || {
-  echo "uso: connect-agent.sh --id <agent-id> --name <Nombre> --location <host>"
+KIND_GIVEN="$KIND"   # recordamos si el usuario pasó --kind (para el resumen "auto")
+
+[ -n "$NAME" ] || {
+  echo "uso: connect-agent.sh --name <Nombre> [--id <agent-id>] [--location <host>]"
   echo "     [--kind hermes|claude|codex] [--portal URL] [--remote]"
   echo "     [--serve-port 9119] [--auth-user faix] [--auth-pass ...]"
   exit 1
 }
+
+# ubicación por defecto: hostname normalizado (no depende del KIND, va ya).
+LOCATION="${LOCATION:-$(hostname -s | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-32)}"
 
 # ------------------------------- 0. sistema -------------------------------
 OS="$(uname -s)"
@@ -91,6 +96,13 @@ if [ -z "$KIND" ]; then
   esac
 fi
 
+# id por defecto: kind-ubicación (sí depende del KIND, ya resuelto arriba).
+ID="${ID:-${KIND}-${LOCATION}}"
+
+KIND_AUTO_LABEL=""
+[ -z "$KIND_GIVEN" ] && KIND_AUTO_LABEL=" (auto)"
+echo "→ conectando: ${NAME}  (id: ${ID} · ubicación: ${LOCATION} · kind: ${KIND}${KIND_AUTO_LABEL})"
+
 # ----------------------------- 2. ver portal -------------------------------
 if [ "$REMOTE" = "1" ]; then
   echo "→ modo REMOTO: este server está fuera de la red del portal (no se prueba el portal)."
@@ -102,15 +114,21 @@ if [ "$REMOTE" = "1" ]; then
 else
   echo "→ probando portal $PORTAL …"
   if ! curl -fsS --max-time 6 "$PORTAL/api/agents" >/dev/null; then
-    echo "✗ Este server no alcanza el portal ($PORTAL)."
-    echo "  ¿Este server está en OTRA red (VPS / nube)? → vuelve a correr con --remote:"
-    echo "    el serve de Hermes se publica con usuario+contraseña y el portal se"
-    echo "    conecta directo; no se necesita túnel."
-    echo "  Alternativa avanzada (misma red con firewall): puente SSH inverso desde el portal:"
-    echo "    ssh -N -R 3000:127.0.0.1:3000 <ssh-alias-de-este-server>"
-    exit 1
+    if [ "$KIND" = "hermes" ]; then
+      echo "⚠ El portal no es alcanzable desde aquí → cambio automático a modo REMOTO (gateway público con credenciales)"
+      REMOTE="1"
+    else
+      echo "✗ Este server no alcanza el portal ($PORTAL)."
+      echo "  ¿Este server está en OTRA red (VPS / nube)? → vuelve a correr con --remote:"
+      echo "    el serve de Hermes se publica con usuario+contraseña y el portal se"
+      echo "    conecta directo; no se necesita túnel."
+      echo "  Alternativa avanzada (misma red con firewall): puente SSH inverso desde el portal:"
+      echo "    ssh -N -R 3000:127.0.0.1:3000 <ssh-alias-de-este-server>"
+      exit 1
+    fi
+  else
+    echo "✓ portal alcanzable"
   fi
-  echo "✓ portal alcanzable"
 fi
 
 BIN_DIR="$HOME/.local/bin/faix"; mkdir -p "$BIN_DIR"

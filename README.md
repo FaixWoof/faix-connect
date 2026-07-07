@@ -6,13 +6,13 @@ Un solo comando en el servidor del agente — detecta si hay **Hermes**,
 **Claude Code** o **Codex**, instala lo necesario y te guía paso a paso:
 
 ```bash
-# desde el portal:
+# desde el portal (solo --name es obligatorio; id/ubicación/tecnología se detectan):
 curl -fsSL http://IP_DEL_PORTAL:3000/connect-agent.sh | bash -s -- \
-  --id mi-agente --name MiAgente --location mihost
+  --name MiAgente --portal http://IP_DEL_PORTAL:3000
 
 # o desde este repo:
 curl -fsSL https://raw.githubusercontent.com/FaixWoof/faix-connect/main/connect-agent.sh | bash -s -- \
-  --id mi-agente --name MiAgente --location mihost --portal http://IP_DEL_PORTAL:3000
+  --name MiAgente --portal http://IP_DEL_PORTAL:3000
 ```
 
 | Tecnología | Qué instala |
@@ -21,8 +21,10 @@ curl -fsSL https://raw.githubusercontent.com/FaixWoof/faix-connect/main/connect-
 | Claude Code | hooks oficiales (`report_status.py`) → estado por evento |
 | Codex | wrapper `faix-codex` que envuelve `codex exec` reportando |
 
-Flags: `--kind hermes|claude|codex` (si el host tiene varios agentes),
-`--portal URL`, `--serve-port 9119`, `--no-serve`.
+Defaults automáticos: `--location` = hostname normalizado, `--id` = `<kind>-<ubicación>`.
+Flags: `--id`, `--location`, `--kind hermes|claude|codex` (si el host tiene varios agentes),
+`--portal URL`, `--serve-port 9119`, `--no-serve`. Si el portal no es alcanzable y hay
+Hermes, cambia SOLO a modo remoto.
 
 ## Servidor REMOTO (VPS / nube) — sin túneles
 
@@ -30,7 +32,7 @@ Si el server está fuera de la red del portal, agrega `--remote` (Hermes):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/FaixWoof/faix-connect/main/connect-agent.sh | sudo -H bash -s -- \
-  --id mi-agente --name MiAgente --location mihost --remote
+  --name MiAgente --remote
 ```
 
 Publica `hermes serve --host 0.0.0.0` con el proveedor de auth **oficial**
