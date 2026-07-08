@@ -84,8 +84,24 @@ fi
 
 # --------------------- rutas y utilidades compartidas -----------------------
 BIN_DIR="$HOME/.local/bin/faix"; mkdir -p "$BIN_DIR"
-if [ "$(id -u)" = "0" ]; then UNIT_DIR="/etc/systemd/system"; SCTL="systemctl"; WANTED="multi-user.target"; else
+PY3="$(command -v python3 || echo /usr/bin/python3)"   # macOS no tiene /usr/bin/python3 por defecto
+if [ "$OS" = "Darwin" ]; then
+  # macOS usa launchd (LaunchAgents del usuario), no systemd.
+  UNIT_DIR="$HOME/Library/LaunchAgents"; mkdir -p "$UNIT_DIR"
+elif [ "$(id -u)" = "0" ]; then UNIT_DIR="/etc/systemd/system"; SCTL="systemctl"; WANTED="multi-user.target"; else
   UNIT_DIR="$HOME/.config/systemd/user"; SCTL="systemctl --user"; WANTED="default.target"; mkdir -p "$UNIT_DIR"; fi
+
+# Pregunta por la terminal aunque el script venga por `curl | bash` (stdin = la
+# tubería). Si NO hay terminal (automatización pura), devuelve el valor por
+# defecto sin bloquear. Así respetamos "pedir datos al usuario cuando toca".
+ask_tty() { # $1 prompt, $2 default -> imprime la respuesta (o el default)
+  local ans=""
+  if [ -e /dev/tty ] && [ -r /dev/tty ]; then
+    printf '%s' "$1" >/dev/tty
+    IFS= read -r ans </dev/tty 2>/dev/null || ans=""
+  fi
+  [ -n "$ans" ] && printf '%s' "$ans" || printf '%s' "$2"
+}
 
 # Hermes se instala de DOS formas: venv del repo (~/.hermes/hermes-agent/venv)
 # o CLI en el PATH (pipx/pip → binario `hermes`). Aceptamos ambas. Esta misma
@@ -96,6 +112,77 @@ detect_installed_kind() {
   command -v claude >/dev/null 2>&1 && found="$found claude"
   command -v codex >/dev/null 2>&1 && found="$found codex"
   echo "$found" | xargs || true
+}
+
+# Lee una credencial guardada en la unit del serve, sea systemd (Environment=)
+# o launchd (<key>…</key><string>…</string>). Devuelve "" si no está.
+read_cred() { # $1 archivo-unit, $2 sufijo (USERNAME/PASSWORD/SECRET)
+  local f="$1" key="HERMES_DASHBOARD_BASIC_AUTH_$2" val=""
+  [ -f "$f" ] || { printf ''; return 0; }
+  val="$(grep -m1 "^Environment=${key}=" "$f" 2>/dev/null | sed -E "s/^Environment=${key}=//" || true)"
+  if [ -z "$val" ]; then
+    val="$(grep "<key>${key}</key>" "$f" 2>/dev/null | grep -oE '<string>[^<]*</string>' | head -1 | sed -E 's/<\/?string>//g' || true)"
+  fi
+  printf '%s' "$val"
+}
+
+# Detiene y borra un servicio (systemd o launchd). Devuelve 0 si borró algo.
+remove_service() { # $1 nombre
+  local name="$1"
+  if [ "$OS" = "Darwin" ]; then
+    local plist="$UNIT_DIR/$name.plist"
+    [ -f "$plist" ] || return 1
+    launchctl unload "$plist" >/dev/null 2>&1 || true
+    rm -f "$plist"; echo "  ✓ servicio $name detenido y borrado (launchd)"; return 0
+  fi
+  [ "$HAS_SYSTEMD" = "1" ] && [ -f "$UNIT_DIR/$name.service" ] || return 1
+  $SCTL disable --now "$name.service" >/dev/null 2>&1 || true
+  rm -f "$UNIT_DIR/$name.service"; echo "  ✓ servicio $name detenido y borrado"; return 0
+}
+
+# Instala/actualiza un LaunchAgent de macOS (equivalente a install_unit systemd).
+# Lee UNIT_EXTRA (líneas Environment=KEY=VALUE) como EnvironmentVariables.
+install_launchd() { # $1 label, $2 execStart
+  local label="$1" exec_start="$2" plist="$UNIT_DIR/$1.plist" a k v kv line
+  local args_xml="" env_xml=""
+  for a in $exec_start; do args_xml="${args_xml}      <string>${a}</string>
+"; done
+  if [ -n "${UNIT_EXTRA:-}" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        Environment=*) kv="${line#Environment=}"; k="${kv%%=*}"; v="${kv#*=}"
+          env_xml="${env_xml}      <key>${k}</key><string>${v}</string>
+";;
+      esac
+    done <<EOF
+${UNIT_EXTRA}
+EOF
+  fi
+  local desired
+  desired="$(cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${label}</string>
+  <key>ProgramArguments</key><array>
+${args_xml}    </array>
+  <key>EnvironmentVariables</key><dict>
+${env_xml}    </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>WorkingDirectory</key><string>${HOME}</string>
+</dict></plist>
+EOF
+)"
+  if [ -f "$plist" ] && [ "$(cat "$plist")" = "$desired" ] && launchctl list "$label" >/dev/null 2>&1; then
+    echo "✓ $label ya configurado y activo (launchd)"; return 0
+  fi
+  [ -f "$plist" ] && echo "→ actualizando servicio $label (launchd)…" || echo "→ instalando servicio $label (launchd)…"
+  printf '%s\n' "$desired" > "$plist"
+  launchctl unload "$plist" >/dev/null 2>&1 || true
+  launchctl load -w "$plist" 2>/dev/null || launchctl load "$plist" 2>/dev/null || true
+  sleep 1
+  launchctl list "$label" >/dev/null 2>&1 && echo "  servicio $label: cargado" || echo "  ⚠ $label no cargó; revisa Console.app / launchctl"
 }
 
 # --------------------- 0b. identidad y multi-instancia ---------------------
@@ -150,13 +237,9 @@ if [ "$UNINSTALL" = "1" ]; then
   echo "→ desinstalando: ${NAME}  (id: ${ID} · ubicación: ${LOCATION})"
 
   for unit in "faix-serve-${ID}" "faix-reporter-${ID}"; do
-    if [ "$HAS_SYSTEMD" = "1" ] && [ -f "$UNIT_DIR/$unit.service" ]; then
-      $SCTL disable --now "$unit.service" >/dev/null 2>&1 || true
-      rm -f "$UNIT_DIR/$unit.service"
-      echo "  ✓ servicio $unit detenido y borrado"
-    fi
+    remove_service "$unit" || true
   done
-  [ "$HAS_SYSTEMD" = "1" ] && { $SCTL daemon-reload || true; }
+  [ "$OS" != "Darwin" ] && [ "$HAS_SYSTEMD" = "1" ] && { $SCTL daemon-reload || true; }
   if [ -f "$BIN_DIR/faix_reporter_${ID}.py" ]; then
     rm -f "$BIN_DIR/faix_reporter_${ID}.py"
     echo "  ✓ reporter borrado"
@@ -222,6 +305,7 @@ fi
 UNIT_EXTRA=""   # líneas extra de [Service] (p.ej. Environment=) — la usa hermes
 
 install_unit() { # $1 nombre, $2 ExecStart
+  [ "$OS" = "Darwin" ] && { install_launchd "$1" "$2"; return $?; }
   [ "$HAS_SYSTEMD" = "1" ] || { echo "  (sin systemd) corre a mano: $2"; return 0; }
   local unit_file="$UNIT_DIR/$1.service"
   local desired
@@ -261,6 +345,10 @@ EOF
 
 open_firewall() { # $1 puerto — abre el puerto localmente (LAN o remoto, best-effort)
   local port="$1"
+  if [ "$OS" = "Darwin" ]; then
+    echo "  firewall: en macOS, si sale un aviso de '¿aceptar conexiones entrantes?' para Hermes/Python, acéptalo (puerto ${port}/tcp)."
+    return 0
+  fi
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow "${port}/tcp" >/dev/null 2>&1 && echo "  firewall: ufw allow ${port}/tcp ✓"
   elif command -v iptables >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
@@ -313,17 +401,25 @@ if [ "$KIND" = "hermes" ]; then
   # ---------- Credenciales: si ya existían, se conservan (NUNCA rotar en un
   # re-run) — salvo que vengan explícitas con --auth-user/--auth-pass. Aplica
   # igual a modo local y --remote, porque ambos usan la misma unit faix-serve.
-  UNIT_FILE_SERVE="$UNIT_DIR/faix-serve-${ID}.service"
+  if [ "$OS" = "Darwin" ]; then UNIT_FILE_SERVE="$UNIT_DIR/faix-serve-${ID}.plist"; else UNIT_FILE_SERVE="$UNIT_DIR/faix-serve-${ID}.service"; fi
   if [ -f "$UNIT_FILE_SERVE" ]; then
-    EXISTING_USER="$(grep -m1 '^Environment=HERMES_DASHBOARD_BASIC_AUTH_USERNAME=' "$UNIT_FILE_SERVE" | sed -E 's/^Environment=HERMES_DASHBOARD_BASIC_AUTH_USERNAME=//' || true)"
-    EXISTING_PASS="$(grep -m1 '^Environment=HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=' "$UNIT_FILE_SERVE" | sed -E 's/^Environment=HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=//' || true)"
-    EXISTING_SECRET="$(grep -m1 '^Environment=HERMES_DASHBOARD_BASIC_AUTH_SECRET=' "$UNIT_FILE_SERVE" | sed -E 's/^Environment=HERMES_DASHBOARD_BASIC_AUTH_SECRET=//' || true)"
+    EXISTING_USER="$(read_cred "$UNIT_FILE_SERVE" USERNAME)"
+    EXISTING_PASS="$(read_cred "$UNIT_FILE_SERVE" PASSWORD)"
+    EXISTING_SECRET="$(read_cred "$UNIT_FILE_SERVE" SECRET)"
     [ "$AUTH_USER_EXPLICIT" = "1" ] || { [ -z "$EXISTING_USER" ] || AUTH_USER="$EXISTING_USER"; }
     [ "$AUTH_PASS_EXPLICIT" = "1" ] || { [ -z "$EXISTING_PASS" ] || AUTH_PASS="$EXISTING_PASS"; }
     [ -z "$EXISTING_SECRET" ] || AUTH_SECRET="$EXISTING_SECRET"
   fi
-  [ -n "$AUTH_PASS" ] || AUTH_PASS="$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+  NEW_PASS="0"
+  [ -n "$AUTH_PASS" ] || { AUTH_PASS="$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"; NEW_PASS="1"; }
   [ -n "${AUTH_SECRET:-}" ] || AUTH_SECRET="$(head -c 96 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"
+
+  # Contraseña NUEVA (no reusada, no pasada con --auth-pass): la ofrecemos por
+  # la terminal para que el usuario ponga la suya si quiere, en vez de generarla
+  # y guardarla en silencio. Sin terminal (automatización) usa la generada.
+  if [ "$NEW_PASS" = "1" ] && [ "$AUTH_PASS_EXPLICIT" = "0" ]; then
+    AUTH_PASS="$(ask_tty "  Define una contraseña para ${NAME} (Enter = usar la generada '${AUTH_PASS}'): " "$AUTH_PASS")"
+  fi
 
   # ---------- REMOTO: serve público con auth basic, sin túnel ni reporter ----
   if [ "$REMOTE" = "1" ]; then
@@ -404,7 +500,7 @@ Environment=HERMES_DASHBOARD_BASIC_AUTH_SECRET=${AUTH_SECRET}"
   # un cambio de --serve-port se detecte como cambio de configuración y el
   # reporter se reinicie (si no, seguiría vigilando el puerto viejo).
   UNIT_EXTRA="Environment=FAIX_SERVE_PORT=${SERVE_PORT}"
-  install_unit "faix-reporter-${ID}" "/usr/bin/python3 ${BIN_DIR}/faix_reporter_${ID}.py"
+  install_unit "faix-reporter-${ID}" "${PY3} ${BIN_DIR}/faix_reporter_${ID}.py"
   UNIT_EXTRA=""
 
   # Autocomprobación: el gate debe quedar ACTIVO con el proveedor basic.
@@ -425,8 +521,14 @@ Environment=HERMES_DASHBOARD_BASIC_AUTH_SECRET=${AUTH_SECRET}"
   AGENT_IP="$ADVERTISE_IP"
   if [ -z "$AGENT_IP" ]; then
     PORTAL_HOST="${PORTAL#*://}"; PORTAL_HOST="${PORTAL_HOST%%/*}"; PORTAL_HOST="${PORTAL_HOST%%:*}"
-    AGENT_IP="$(ip route get "$PORTAL_HOST" 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' || true)"
-    [ -n "$AGENT_IP" ] || AGENT_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    if [ "$OS" = "Darwin" ]; then
+      IFACE="$(route -n get "$PORTAL_HOST" 2>/dev/null | awk '/interface:/{print $2}' | head -1 || true)"
+      [ -n "$IFACE" ] && AGENT_IP="$(ipconfig getifaddr "$IFACE" 2>/dev/null || true)"
+      [ -n "$AGENT_IP" ] || AGENT_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+    else
+      AGENT_IP="$(ip route get "$PORTAL_HOST" 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' || true)"
+      [ -n "$AGENT_IP" ] || AGENT_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    fi
   fi
 
   GW_HTTP="" GW_BODY="" GW_ERR=""
@@ -458,6 +560,8 @@ Environment=HERMES_DASHBOARD_BASIC_AUTH_SECRET=${AUTH_SECRET}"
 
   if [ "$GW_HTTP" = "200" ]; then
     echo "  ✓ registrado en el portal (chat verificado)"
+    echo "  🔑 credenciales de ${NAME}:  usuario ${AUTH_USER}  ·  contraseña ${AUTH_PASS}"
+    echo "     (el portal ya las guardó; anótalas por si reinstalas en otra parte)"
     echo
     echo "════════════════════════════════════════════════════════════════"
     echo "🎉 TODO LISTO — abre el portal: ${NAME} ya aparece y el CHAT EN VIVO está activo."
