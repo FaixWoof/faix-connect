@@ -71,7 +71,15 @@ KIND_GIVEN="$KIND"   # recordamos si el usuario pasó --kind (para el resumen "a
 }
 
 # ubicación por defecto: hostname normalizado (no depende del KIND, va ya).
-LOCATION="${LOCATION:-$(hostname -s | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-32)}"
+# Portable: hay sistemas mínimos SIN el comando `hostname` (Arch base,
+# contenedores, Termux) — caemos a `uname -n` (POSIX) o /proc.
+host_short() {
+  { hostname -s 2>/dev/null \
+    || uname -n 2>/dev/null \
+    || cat /proc/sys/kernel/hostname 2>/dev/null \
+    || echo "agente"; } | cut -d. -f1
+}
+LOCATION="${LOCATION:-$(host_short | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-32)}"
 
 # ------------------------------- 0. sistema -------------------------------
 OS="$(uname -s)"
